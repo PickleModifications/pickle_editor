@@ -1,0 +1,336 @@
+if GetResourceState('qb-core') ~= 'started' then return end
+
+QBCore = exports['qb-core']:GetCoreObject()
+
+function ShowNotification(text)
+	QBCore.Functions.Notify(text)
+end
+
+function CanAccessGroup(data)
+    if not data then return true end
+    local pdata = QBCore.Functions.GetPlayerData()
+    for k,v in pairs(data) do 
+        if (pdata.job.name == k and pdata.job.grade.level >= v) then return true end
+    end
+    return false
+end 
+
+function GetPlayersInArea(coords, radius)
+    local coords = coords or GetEntityCoords(PlayerPedId())
+    local radius = radius or 3.0
+    local list = QBCore.Functions.GetPlayersFromCoords(coords, radius)
+    local players = {}
+    for _, player in pairs(list) do 
+        if player ~= PlayerId() then
+            players[#players + 1] = player
+        end
+    end
+    return players
+end
+
+
+function ToggleOutfit(onduty)
+    if onduty then 
+        local outfits = Config.BountyHunters.outfits
+        local gender = QBCore.Functions.GetPlayerData().charinfo.gender
+        local outfit = gender == 1 and outfits.female or outfits.male
+        if not outfit then return end 
+        TriggerEvent('qb-clothing:client:loadOutfit', {outfitData = outfit})
+    else
+        TriggerServerEvent("qb-clothes:loadPlayerSkin")
+    end
+end
+
+function ResetClothes()
+    TriggerServerEvent("qb-clothes:loadPlayerSkin")
+end
+
+function Revive()
+    TriggerEvent("hospital:client:Revive")
+    TriggerServerEvent("hospital:server:resetHungerThirst")
+end
+
+function Kill()
+    SetEntityHealth(PlayerPedId(), 0)
+end
+
+RegisterNetEvent(GetCurrentResourceName()..":showNotification", function(text)
+    ShowNotification(text)
+end)
+
+RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
+    TriggerServerEvent("pickle_editor:initializePlayer")
+end)
+
+-- Drunk Effects System
+local CurrentAlcoholLevel = 0.0 -- Current alcohol level as proportion of alcoholPerDrink
+local IsDrunkEffectsActive = false
+local CurrentWalkCycle = nil
+local DrunkEffectsThread = nil
+
+-- Function to get current drunk level category
+local function GetDrunkLevel()
+    if not Config.DrunkEffects or not Config.DrunkEffects.enabled then return "none" end
+    
+    local thresholds = Config.DrunkEffects.thresholds
+    if CurrentAlcoholLevel >= thresholds.extreme then
+        return "extreme"
+    elseif CurrentAlcoholLevel >= thresholds.heavy then
+        return "heavy"
+    elseif CurrentAlcoholLevel >= thresholds.moderate then
+        return "moderate"
+    elseif CurrentAlcoholLevel >= thresholds.light then
+        return "light"
+    elseif CurrentAlcoholLevel > 0.0 then
+        -- Return "light" even below threshold to start effects immediately
+        return "light"
+    else
+        return "none"
+    end
+end
+
+-- Function to apply visual effects
+local function ApplyVisualEffects(level)
+    if not Config.DrunkEffects or not Config.DrunkEffects.enabled or not Config.DrunkEffects.visualEffects then 
+        ClearTimecycleModifier()
+        ClearExtraTimecycleModifier()
+        return 
+    end
+    
+    local ped = PlayerPedId()
+    
+    if CurrentAlcoholLevel > 0.0 then
+        -- Calculate intensity based on alcohol level (0.0 to 1.0+)
+        -- Map alcohol level to intensity, capping at 1.0
+        local maxLevel = Config.DrunkEffects.thresholds.extreme
+        local actualIntensity = math.min(1.0, CurrentAlcoholLevel / math.max(0.01, maxLevel))
+        
+        -- Apply timecycle modifier (drug_wobbly is the standard drunk effect)
+        SetTimecycleModifier("drug_wobbly")
+        SetTimecycleModifierStrength(actualIntensity)
+        
+        -- Enable ped motion blur and drunk state
+        SetPedMotionBlur(ped, true)
+        SetPedIsDrunk(ped, true)
+    else
+        -- Cleanup when no alcohol
+        ClearTimecycleModifier()
+        ClearExtraTimecycleModifier()
+        SetPedMotionBlur(ped, false)
+        SetPedIsDrunk(ped, false)
+    end
+end
+
+-- Function to apply camera shake
+local function ApplyCameraShake(level)
+    if not Config.DrunkEffects or not Config.DrunkEffects.enabled or not Config.DrunkEffects.cameraShake then 
+        StopGameplayCamShaking(true)
+        return 
+    end
+    
+    if CurrentAlcoholLevel > 0.0 then
+        -- Calculate intensity based on alcohol level (0.0 to 1.0+)
+        -- Map alcohol level to intensity, capping at 1.0
+        local maxLevel = Config.DrunkEffects.thresholds.extreme
+        local actualIntensity = math.min(1.0, CurrentAlcoholLevel / math.max(0.01, maxLevel))
+        
+        -- Continuously apply shake (needs to be called every frame)
+        -- Using DRUNK_SHAKE as shown in the example
+        ShakeGameplayCam("DRUNK_SHAKE", actualIntensity)
+    else
+        StopGameplayCamShaking(true)
+    end
+end
+
+-- Function to apply walk cycle
+local function ApplyWalkCycle(level)
+    if not Config.DrunkEffects or not Config.DrunkEffects.enabled or not Config.DrunkEffects.enableWalkCycles then 
+        -- If walk cycles are disabled, ensure we reset if one was active
+        if CurrentWalkCycle then
+            local ped = PlayerPedId()
+            ResetPedMovementClipset(ped, 0.25)
+            CurrentWalkCycle = nil
+        end
+        return 
+    end
+    
+    local ped = PlayerPedId()
+    
+    if level == "none" then
+        -- Reset walk cycle to default
+        if CurrentWalkCycle then
+            ResetPedMovementClipset(ped, 0.25)
+            CurrentWalkCycle = nil
+            
+            -- Debug output
+            if Config.Debug and Config.DrunkEffects.debug then
+                print("[Drunk Effects] Walk cycle reset to normal")
+            end
+        end
+        return
+    end
+    
+    local walkCycleClipset = Config.DrunkEffects.walkCycles[level]
+    if not walkCycleClipset then return end
+    
+    -- Only change if different from current
+    if CurrentWalkCycle ~= level then
+        RequestAnimSet(walkCycleClipset)
+        while not HasAnimSetLoaded(walkCycleClipset) do
+            Wait(0)
+        end
+        
+        SetPedMovementClipset(ped, walkCycleClipset, 0.25)
+        CurrentWalkCycle = level
+        
+        -- Debug output
+        if Config.Debug and Config.DrunkEffects.debug then
+            print(string.format("[Drunk Effects] Walk cycle changed to: %s", level))
+        end
+    end
+end
+
+-- Main drunk effects thread
+local function StartDrunkEffectsThread()
+    if DrunkEffectsThread then return end
+    
+    DrunkEffectsThread = CreateThread(function()
+        while Config.DrunkEffects and Config.DrunkEffects.enabled and CurrentAlcoholLevel > 0.0 do
+            Wait(0) -- Update every frame for smooth effects
+            
+            local level = GetDrunkLevel()
+            
+            -- Apply all effects every frame
+            ApplyVisualEffects(level)
+            ApplyCameraShake(level)
+            ApplyWalkCycle(level)
+            
+            -- Debug output (can be removed later)
+            if Config.Debug and Config.DrunkEffects.debug then
+                if math.random(1, 300) == 1 then -- Print every ~5 seconds
+                    print(string.format("[Drunk Effects] Level: %s, Alcohol: %.4f, Intensity: %.2f", 
+                        level, CurrentAlcoholLevel, Config.DrunkEffects.visualIntensity[level] or 0))
+                end
+            end
+        end
+        
+        -- Cleanup when alcohol reaches 0 (ensure walk cycle is reset)
+        local ped = PlayerPedId()
+        local level = GetDrunkLevel() -- Should be "none" at this point
+        
+        -- Explicitly reset walk cycle
+        ApplyWalkCycle(level) -- This will handle the reset if level is "none"
+        
+        -- Additional cleanup
+        ClearTimecycleModifier()
+        ClearExtraTimecycleModifier()
+        StopGameplayCamShaking(true)
+        SetPedMotionBlur(ped, false)
+        SetPedIsDrunk(ped, false)
+        
+        -- Ensure walk cycle is reset even if ApplyWalkCycle didn't catch it
+        if CurrentWalkCycle then
+            ResetPedMovementClipset(ped, 0.25)
+            CurrentWalkCycle = nil
+        end
+        
+        -- Debug output
+        if Config.Debug and Config.DrunkEffects.debug then
+            print("[Drunk Effects] Cleanup complete - walk cycle reset")
+        end
+        
+        DrunkEffectsThread = nil
+        IsDrunkEffectsActive = false
+    end)
+end
+
+-- Alcohol decay thread
+CreateThread(function()
+    while true do
+        Wait(Config.DrunkEffects and Config.DrunkEffects.decayInterval or 1000)
+        
+        if Config.DrunkEffects and Config.DrunkEffects.enabled and CurrentAlcoholLevel > 0.0 then
+            local decayAmount = Config.DrunkEffects.decayRate * (Config.DrunkEffects.decayInterval / 1000)
+            CurrentAlcoholLevel = math.max(0.0, CurrentAlcoholLevel - decayAmount)
+            
+            -- Start effects thread if not already running
+            if CurrentAlcoholLevel > 0.0 and not IsDrunkEffectsActive then
+                IsDrunkEffectsActive = true
+                StartDrunkEffectsThread()
+            end
+        end
+    end
+end)
+
+-- Cleanup on resource stop
+AddEventHandler('onResourceStop', function(resourceName)
+    if GetCurrentResourceName() ~= resourceName then return end
+    
+    -- Reset all drunk effects
+    CurrentAlcoholLevel = 0.0
+    local ped = PlayerPedId()
+    ClearTimecycleModifier()
+    ClearExtraTimecycleModifier()
+    StopGameplayCamShaking(true)
+    SetPedMotionBlur(ped, false)
+    SetPedIsDrunk(ped, false)
+    
+    if CurrentWalkCycle then
+        ResetPedMovementClipset(ped, 0.0)
+        CurrentWalkCycle = nil
+    end
+    
+    IsDrunkEffectsActive = false
+    DrunkEffectsThread = nil
+end)
+
+RegisterNetEvent("pickle_editor:addAlcohol", function(amount)
+    local progress = amount / Config.Drinks.alcoholPerDrink
+    
+    -- Add to current alcohol level
+    if Config.DrunkEffects and Config.DrunkEffects.enabled then
+        CurrentAlcoholLevel = CurrentAlcoholLevel + progress
+        
+        -- Start effects thread immediately if not already running
+        if CurrentAlcoholLevel > 0.0 and not IsDrunkEffectsActive then
+            IsDrunkEffectsActive = true
+            StartDrunkEffectsThread()
+        end
+        
+        -- Debug output
+        if Config.Debug and Config.DrunkEffects.debug then
+            print(string.format("[Drunk Effects] Added alcohol: %.4f, Total: %.4f", progress, CurrentAlcoholLevel))
+        end
+    end
+    
+    -- Evidence system (existing functionality)
+    if progress < 0.5 then
+        TriggerEvent('evidence:client:SetStatus', 'alcohol', 600)
+    else
+        TriggerEvent('evidence:client:SetStatus', 'heavyalcohol', 600)
+        TriggerEvent('evidence:client:SetStatus', 'widepupils', 600)
+    end
+end)
+
+-- Inventory Fallback
+
+CreateThread(function()
+    Wait(100)
+    
+    if InitializeInventory then return InitializeInventory() end -- Already loaded through inventory folder.
+
+    Inventory = {}
+
+    Inventory.Items = {}
+    
+    Inventory.Ready = false
+    
+    RegisterNetEvent("pickle_editor:setupInventory", function(data)
+        Inventory.Items = data.items
+        Inventory.Ready = true
+    end)
+    
+    RegisterNetEvent("pickle_editor:updateInventory", function(inventory) 
+        -- RefreshInventory(inventory)
+    end)
+end)
